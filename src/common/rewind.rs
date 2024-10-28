@@ -15,6 +15,7 @@ pub(crate) struct Rewind<T> {
     pub(crate) inner: T,
 }
 
+#[allow(dead_code)]
 impl<T> Rewind<T> {
     #[cfg(test)]
     pub(crate) fn new(io: T) -> Self {

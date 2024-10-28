@@ -66,6 +66,98 @@ pub struct Builder<E> {
     _executor: E,
 }
 
+// pin_project! {
+//     #[project = ConnStateProj]
+//     enum ConnState<'a, I, S, E>
+//     where
+//         S: HttpService<Incoming>,
+//     {
+//         ReadVersion {
+//             #[pin]
+//             read_version: ReadVersion<I>,
+//             builder: Cow<'a, Builder<E>>,
+//             service: Option<S>,
+//         },
+//         H1 {
+//             #[pin]
+//             conn: Http1Connection<I, S>,
+//         },
+//         H2 {
+//             #[pin]
+//             conn: Http2Connection<I, S, E>,
+//         },
+//     }
+// }
+
+pin_project! {
+    #[project = ConnectionTypeProj]
+    /// An enum representing the different connection types
+    /// supported by this crate
+    #[allow(missing_docs)]
+    pub enum ConnectionType<'a, I, S, E>
+    where
+        S: HttpService<Incoming>,
+    {
+        /// A connection that only supports HTTP/1 or HTTP/2.
+        Connection{
+            #[pin]
+            conn: Connection<'a, I, S, E>
+        },
+        /// A connection that supports HTTP/1 and can upgrade to HTTP/2.
+        UpgradeableConnection{
+            #[pin]
+            conn: UpgradeableConnection<'a, I, S, E>
+        },
+    }
+}
+
+impl<I, S, E, B> ConnectionType<'_, I, S, E>
+where
+    S: HttpService<Incoming, ResBody = B>,
+    S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    I: Read + Write + Unpin,
+    B: Body + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    E: HttpServerConnExec<S::Future, B>,
+{
+    /// Start a graceful shutdown process for this connection.
+    ///
+    /// This `Connection` should continue to be polled until shutdown can finish.
+    ///
+    /// # Note
+    ///
+    /// This should only be called while the `Connection` future is still pending. If called after
+    /// `Connection::poll` has resolved, this does nothing.
+    pub fn graceful_shutdown(self: Pin<&mut Self>) {
+        let this = self.project();
+        match this {
+            ConnectionTypeProj::Connection{conn} => conn.graceful_shutdown(),
+            ConnectionTypeProj::UpgradeableConnection{conn} => conn.graceful_shutdown(),
+        }
+    }
+}
+
+impl<I, S, E, B> Future for ConnectionType<'_, I, S, E>
+where
+    S: Service<Request<Incoming>, Response = Response<B>>,
+    S::Future: 'static,
+    S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    B: Body + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    I: Read + Write + Unpin + 'static,
+    E: HttpServerConnExec<S::Future, B>,
+{
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this {
+            ConnectionTypeProj::Connection{conn} => conn.poll(cx),
+            ConnectionTypeProj::UpgradeableConnection{conn} => conn.poll(cx),
+        }
+    }
+}
+
 impl<E> Builder<E> {
     /// Create a new auto connection builder.
     ///
@@ -127,8 +219,14 @@ impl<E> Builder<E> {
         self
     }
 
+    /// Returns the supported version of HTTP by this
+    /// connection builder. None means both HTTP/1 and HTTP/2.
+    pub fn supported_version(&self) -> Option<Version> {
+        self.version.clone()
+    }
+
     /// Bind a connection together with a [`Service`].
-    pub fn serve_connection<I, S, B>(&self, io: I, service: S) -> Connection<'_, I, S, E>
+    pub fn serve_connection<I, S, B>(&self, io: I, service: S) -> ConnectionType<'_, I, S, E>
     where
         S: Service<Request<Incoming>, Response = Response<B>>,
         S::Future: 'static,
@@ -159,7 +257,7 @@ impl<E> Builder<E> {
             },
         };
 
-        Connection { state }
+        ConnectionType::Connection{ conn: Connection { state }}
     }
 
     /// Bind a connection together with a [`Service`], with the ability to
@@ -193,9 +291,12 @@ impl<E> Builder<E> {
     }
 }
 
+/// The supported versions of HTTP.
 #[derive(Copy, Clone, Debug)]
-enum Version {
+pub enum Version {
+    /// HTTP/1
     H1,
+    /// HTTP/2
     H2,
 }
 
